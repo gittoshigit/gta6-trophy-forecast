@@ -1,0 +1,7 @@
+*.log
+*_raw.md
+BRIEF.md
+REVIEW.md
+entry/
+tools/
+__pycache__/
