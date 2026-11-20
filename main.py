@@ -16,10 +16,21 @@ PRIORS = ((.6, 72), (.3, 120), (.2, 150), (.03, 400))
 # Enabled for offline ablations. The synthetic smoke run favored no anchoring.
 ANCHOR = 0.
 PHI = .7
-DEFAULT_SCALE = 1.15
+DEFAULT_SCALE = 1.25
+SCALE_GRID = (.85, 1., 1.15, 1.3, 1.5, 1.8, 2.2, 2.7, 3.2)
+SCALE_CLAMP = (1., 2.4)
+JUMP_FLOOR = .06
+TIME_SCALE = 1.0
+R0_SHAPE = 4
+R0_MU = (1.5, 2, 3, 4, 6)
+R0_PI = (.15, .25, .30, .20, .10)
+R0_KEEP = .30
+R0_LOG_G = (math.log(5), .55)
+R0_LOG_KAPPA = (math.log(.08), .60)
+R0_GAMMA = .5
+R0_NB_SIZE = 1.0
 DO_BACKTEST = True
 SECOND_KERNEL = True
-OPTIONAL_FIT_WORK_LIMIT = 52800  # 40 states × 55 trophies × 24 tau values
 ONLY_COMPONENT = None
 GH = ((-2.856970, .011257), (-1.355626, .222076), (0, .533334),
       (1.355626, .222076), (2.856970, .011257))
@@ -327,32 +338,79 @@ def scenarios(states, clock, mean):
             yield (t, max(1, cur.p+total-purge*duration), batches, count, mass/9)
 
 
-def check_time(start, limit=6.0):
-    if time.monotonic()-start >= limit:
+def check_time(start, limit=6.3):
+    if time.monotonic()-start >= limit*TIME_SCALE:
         raise TimeoutError("forecast time guard")
 
 
-def r0(states, clock, mean, levels):
+def r0_clock(states, checkpoint, target):
     cur = states[-1]
-    z = normal_grid(15)
+    age = max(0., checkpoint-cur.start)
+    horizon = max(0., target-checkpoint)
+    shape = R0_SHAPE
+
+    def equilibrium(x):
+        return gamma_survival(shape+1, x) - x/shape*gamma_survival(shape, x)
+
+    rates = [shape/mu for mu in R0_MU]
+    posterior = [prior*equilibrium(age*rate) for prior,rate in zip(R0_PI,rates)]
+    evidence = sum(posterior)
+    p0 = R0_KEEP*sum(prior*equilibrium((age+horizon)*rate)
+                     for prior,rate in zip(R0_PI,rates))/evidence
+    second = sum(weight*(1-gamma_survival(shape, rate*horizon/2))
+                 for weight,rate in zip(posterior,rates))/evidence
+    p2 = (1-p0)*second
+    return [(cur.t, 0, p0), (target, 1, 1-p0-p2), (target, 2, p2)]
+
+
+def r0(states, clock, groups, auto, levels):
+    cur = states[-1]
+    grid = normal_grid(9)
+    growth = [max(1.2, math.exp(R0_LOG_G[0]+R0_LOG_G[1]*z)) for z in grid]
+    kappas = [math.exp(R0_LOG_KAPPA[0]+R0_LOG_KAPPA[1]*z) for z in grid]
+
+    logs = [math.log(r) for r,g,skip in zip(cur.rates,groups,auto) if r > 0 and g != 3 and not skip]
+    center = statistics.mean(logs) if logs else 0.
+    spread = max(.1, statistics.pstdev(logs)) if logs else .1
+    group_weights = [math.sqrt((a/tau)/(PRIORS[0][0]/PRIORS[0][1])) for a,tau in PRIORS]
+    rates = [max(r, 50/cur.p) for r in cur.rates]
+    weighted = [r*group_weights[g]*math.exp(R0_GAMMA*clip((math.log(r)-center)/spread, -2.5, 2.5))
+                for r,g in zip(rates,groups)]
+    total = sum(r for r,skip in zip(rates,auto) if not skip)
+    norm = sum(r for r,skip in zip(weighted,auto) if not skip)/total if total else 1.
+    scenarios = [(max(cur.p+1, round(g*cur.p*(1.5 if count == 2 else 1))), mass/81)
+                 for _,count,mass in clock if count and mass > 0 for g in growth]
+    p0 = clock[0][2]
+    size = R0_NB_SIZE
     result = []
-    for i, r in enumerate(cur.rates):
-        draw = []
-        for t, count, mass in clock:
-            if count == 0:
-                draw.append((logit(r), mass))
-                continue
-            center, spread = jump_prior(cur, [], mean, t)
-            for j in range(len(z)):
-                growth = [math.exp(max(0, center+spread*z[(j+4*k)%len(z)]))
-                          for k in range(count)]
-                for h, shock in enumerate(z):
-                    value = r
-                    for k, g in enumerate(growth):
-                        kap = .1*math.exp(.6*shock + .5*z[(7*h+i+3*k)%len(z)])
-                        value = (value + min(100, kap*value)*(g-1))/g
-                    draw.append((logit(value), mass/len(z)**2))
-        result.append(quantiles(draw, levels))
+    for r,c,wr,skip in zip(cur.rates,cur.counts,weighted,auto):
+        if skip:
+            result.append([logit(r)]*len(levels))
+            continue
+        draws = [(logit(r), p0)] if p0 > 0 else []
+        for players,mass in scenarios:
+            increment = (players-cur.p)*(wr/100)/norm
+            for kappa in kappas:
+                mean = kappa*increment
+                if mean > 60:
+                    variance = math.log1p(1/mean+1/size)
+                    center = math.log(mean)-variance/2
+                    spread = math.sqrt(variance)
+                    draws.extend((logit(100*min(players, c+math.exp(center+spread*z))/players),
+                                  mass*w) for z,w in GH)
+                    continue
+                prob = (size/(size+mean))**size
+                decay = mean/(size+mean)
+                atoms = [(logit(100*min(players, c)/players), prob)]
+                cumulative = prob
+                for j in range(1,401):
+                    if cumulative >= 1-1e-4:
+                        break
+                    prob *= (j-1+size)/j*decay
+                    atoms.append((logit(100*min(players, c+j)/players), prob))
+                    cumulative += prob
+                draws.extend((x, w*(mass/cumulative)) for x,w in atoms)
+        result.append(quantiles(draws, levels))
     return result
 
 
@@ -498,7 +556,7 @@ def posterior(states, fit, taus, weights, groups, auto, start):
         jump_errors.extend(b-a for a,b in zip(errors,errors[1:]))
         cache[i] = (residuals,rms)
     sigma = clip(statistics.pstdev(map_errors) if map_errors else .08,.04,.3)
-    jump = clip(statistics.pstdev(jump_errors) if jump_errors else .10,.03,.3)
+    jump = clip(statistics.pstdev(jump_errors) if jump_errors else .10,JUMP_FLOOR,.3)
     pooled = [(tuple((v+statistics.mean(col))/2 for v,col in zip(prior,zip(*items)))
                if items else prior) for prior,items in zip(base,means)]
     points = {}
@@ -552,8 +610,8 @@ def cohort_future(taus, fit, scenario, p0):
             for tau in taus]
 
 
-def compress_states(states, last):
-    while len(states) > 80:
+def compress_states(states, last, limit):
+    while len(states) > limit:
         old, new = [], []
         for s in states[1:-1]:
             (old if s.t < last-24 else new).append(s)
@@ -682,10 +740,17 @@ def pinball(rows, actual, auto, factor=1):
 def calibrate(case, states, launch, last, target, auto, default, fixed, start):
     ratio = max(1.001,target/max(1,last))
     totals = dict.fromkeys(default,0.)
-    scales = {s:0. for s in (.7,.85,1.,1.15,1.3,1.5,1.8,2.2)}
+    scales = dict.fromkeys(SCALE_GRID,0.)
     pooled_loss = weight_sum = 0.
-    for power, weight in ((1,.6),(.5,.4)):
-        cut = last/ratio**power
+    best_scales = []
+    cut_a = last/ratio
+    origins = [(cut_a,.45),(last/ratio**.5,.30)]
+    cut_c = max(12,states[3].start+1e-6)
+    if cut_c <= cut_a-3:
+        origins.append((cut_c,.25))
+    for cut, weight in origins:
+        if time.monotonic()-start >= 5.0*TIME_SCALE:
+            break
         if sum(s.start <= cut for s in states) < 4:
             continue
         history = [r for r in case["history"] if stamp(r["at"])-launch <= cut]
@@ -695,7 +760,7 @@ def calibrate(case, states, launch, last, target, auto, default, fixed, start):
             check_time(start)
             result = forecast_case(child,depth=1,start=start,fixed=fixed)
         except Exception:
-            break
+            continue
         if not isinstance(result, tuple):
             continue
         pooled, separate = result
@@ -706,11 +771,13 @@ def calibrate(case, states, launch, last, target, auto, default, fixed, start):
             row = separate.get(name, pooled)
             totals[name] += weight*pinball(row,actual,auto)
         pooled_loss += weight*pinball(pooled,actual,auto)
-        for s in scales:
-            scales[s] += weight*pinball(pooled,actual,auto,s)
+        losses = {s:pinball(pooled,actual,auto,s) for s in scales}
+        best_scales.append(min(losses,key=losses.get))
+        for s,loss in losses.items():
+            scales[s] += weight*loss
         weight_sum += weight
     if not weight_sum:
-        return default, DEFAULT_SCALE
+        return default, DEFAULT_SCALE, 0, None, None
     unscaled = {name:w*math.exp(-3*(totals[name]-min(totals.values()))/weight_sum)
                 for name,w in default.items()}
     total = sum(unscaled.values())
@@ -719,8 +786,10 @@ def calibrate(case, states, launch, last, target, auto, default, fixed, start):
         for name in ("F","T"):
             weights[name] *= .8/(1-weights["C"])
         weights["C"] = .2
-    scale = clip((min(scales,key=scales.get)+DEFAULT_SCALE)/2,.8,2)
-    return weights, scale
+    best = min(scales,key=scales.get)
+    high = max(best_scales)
+    scale = clip(.50*best+.25*high+.25*DEFAULT_SCALE,*SCALE_CLAMP)
+    return weights, scale, len(best_scales), best, high
 
 
 def iso(hour):
@@ -767,7 +836,31 @@ def render(rows, states, groups, auto, unknown, levels, is_r0):
     return result
 
 
+def fit_primary(states, last, groups, auto, start, fixed, depth):
+    fitted = compress_states(states,last,30 if depth else 48)
+    n = 16 if depth or len(fitted)*len(groups)*24 > 63360 else 24
+    taus = [.5*math.exp(math.log(6000)*j/(n-1)) for j in range(n)]
+    weights = obs_weights(fitted,last)
+    fits, profile_weight = choose_kernels(fitted,weights,groups,auto,taus,start,fixed)
+    points, sigma, jump = posterior(fitted,fits[0],taus,weights,groups,auto,start)
+    return fitted, taus, weights, fits, profile_weight, points, sigma, jump
+
+
 def forecast_case(case, depth=0, start=None, fixed=None):
+    diagnostic = dict(origins=0, best=None, high=None, scale=DEFAULT_SCALE, stage="S1")
+    try:
+        return forecast_rows(case,depth,start,fixed,diagnostic)
+    finally:
+        if not depth:
+            def value(key):
+                number = diagnostic[key]
+                return "-" if number is None else f"{number:.4f}"
+            print(f"calib origins={diagnostic['origins']} s*={value('best')} "
+                  f"s_hi={value('high')} s_cal={value('scale')} stage={diagnostic['stage']}",
+                  file=sys.stderr)
+
+
+def forecast_rows(case, depth, start, fixed, diagnostic):
     start = time.monotonic() if start is None else start
     if not case.get("history") or case["horizon_minutes"] <= 0:
         return safe_fallback(case, minimum=bool(case.get("history")))
@@ -781,57 +874,83 @@ def forecast_case(case, depth=0, start=None, fixed=None):
     auto = [not unknown[i] and r == 100 and
             all(s.rates[i] >= 99.9 for s in states if s.p >= 1000)
             for i,r in enumerate(states[-1].rates)]
-    mean, clock = renewal(states, checkpoint, target)
     if len(states) == 1:
-        rows = r0(states,clock,mean,levels)
+        rows = r0(states,r0_clock(states,checkpoint,target),groups,auto,levels)
         return render(rows,states,groups,auto,unknown,levels,True)
-    futures = list(scenarios(states,clock,mean))
-    rich = len(states) >= 5 and last >= 12
-    fitted_states = compress_states(states,last) if rich else states
-    taus = []
-    models = []
-    optional_fit = False
-    sigma, jump = .08,.10
-    if rich:
-        n = 16 if depth else 24
-        taus = [.5*math.exp(math.log(6000)*j/(n-1)) for j in range(n)]
-        work = len(fitted_states)*len(groups)*len(taus)
-        optional_fit = not depth and work <= OPTIONAL_FIT_WORK_LIMIT
-        weights = obs_weights(fitted_states,last)
-        fits, profile_weight = choose_kernels(fitted_states,weights,groups,auto,taus,start,fixed)
-        fit = fits[0]
-        points,sigma,jump = posterior(fitted_states,fit,taus,weights,groups,auto,start)
-        models = [(fit,points,1.)]
-    default = {"C":.5,"F":.3,"T":.2} if models else {"F":.6,"T":.2,"D":.2}
+    mean, clock = renewal(states, checkpoint, target)
+    rich = len(states) >= 4 if depth else len(states) >= 5 and last >= 12
+    scale = 1. if depth else DEFAULT_SCALE
+    if not rich:
+        default = {"F":.6,"T":.2,"D":.2}
+        if ONLY_COMPONENT in default and not depth:
+            default = {ONLY_COMPONENT:1.}
+        futures = list(scenarios(states,clock,mean))
+        components = pool_draws(states,futures,groups,auto,[],[],start,last)
+        rows, clouds = predict(components,default,states,.08,.10,missing,auto,scale,levels,start)
+        if depth:
+            return rows,{name:summarize(clouds,{name:1.},levels,start) for name in clouds}
+        return render(rows,states,groups,auto,unknown,levels,False)
+
+    default = {"C":.5,"F":.3,"T":.2}
     if ONLY_COMPONENT in default and not depth:
         default = {ONLY_COMPONENT:1.}
-    scale = 1. if depth else DEFAULT_SCALE
-    components = pool_draws(fitted_states,futures,groups,auto,models,taus,start,last)
-    rows, clouds = predict(components,default,states,sigma,jump,missing,auto,scale,levels,start)
     if depth:
-        separate = {name:summarize(clouds,{name:1.},levels,start) for name in clouds}
-        return rows,separate
-    if optional_fit and SECOND_KERNEL and len(fits)>1 and profile_weight > 0:
-        other = fits[1]
-        # The profile scores use rates in percent, so estimate variance in percent squared.
-        rate_variance = max(.0001, fit[0]/profile_weight)
-        relative = math.exp(-.125*(other[0]-fit[0])/rate_variance)
-        if relative >= 1e-4:
-            try:
-                points2,sigma2,jump2 = posterior(fitted_states,other,taus,weights,groups,auto,start)
-                norm = 1+relative
-                mixture = [(fit,points,1/norm),(other,points2,relative/norm)]
-                extra = pool_draws(fitted_states,futures,groups,auto,mixture,taus,start,last)
-                rows, clouds = predict(extra,default,states,(sigma+relative*sigma2)/norm,
-                                       (jump+relative*jump2)/norm,missing,auto,scale,levels,start)
-            except Exception:
-                pass
-    if optional_fit and DO_BACKTEST and ONLY_COMPONENT is None:
+        fitted, taus, _, fits, _, points, sigma, jump = fit_primary(
+            states,last,groups,auto,start,fixed,depth)
+        futures = list(scenarios(states,clock,mean))
+        components = pool_draws(fitted,futures,groups,auto,[(fits[0],points,1.)],taus,start,last)
+        rows, clouds = predict(components,default,states,sigma,jump,missing,auto,scale,levels,start)
+        return rows,{name:summarize(clouds,{name:1.},levels,start) for name in clouds}
+
+    rows = futures = None
+    try:
+        futures = list(scenarios(states,clock,mean))
+        weights_ft = {ONLY_COMPONENT:1.} if ONLY_COMPONENT in ("F","T") else {"F":.6,"T":.4}
+        components = pool_draws(states,futures,groups,auto,[],[],start,last)
+        rows, _ = predict(components,weights_ft,states,.08,.10,missing,auto,scale,levels,start)
+    except Exception:
+        pass
+
+    if futures is not None and time.monotonic()-start < 2.5*TIME_SCALE:
         try:
-            check_time(start)
-            calibrated,scale = calibrate(case,states,launch,last,target,auto,default,fit[1:3],start)
-            if scale != DEFAULT_SCALE or calibrated != default:
+            fitted, taus, weights, fits, profile_weight, points, sigma, jump = fit_primary(
+                states,last,groups,auto,start,fixed,depth)
+            fit = fits[0]
+            components = pool_draws(fitted,futures,groups,auto,[(fit,points,1.)],taus,start,last)
+            rows, clouds = predict(components,default,states,sigma,jump,missing,auto,scale,levels,start)
+            diagnostic["stage"] = "S2"
+        except Exception:
+            pass
+    if diagnostic["stage"] == "S1":
+        if rows is None:
+            return safe_fallback(case)
+        return render(rows,states,groups,auto,unknown,levels,False)
+
+    if SECOND_KERNEL and time.monotonic()-start < 3.5*TIME_SCALE:
+        try:
+            if len(fits) > 1 and profile_weight > 0:
+                other = fits[1]
+                # Profile scores and variance are in percent squared.
+                rate_variance = max(.0001,fit[0]/profile_weight)
+                relative = math.exp(-.125*(other[0]-fit[0])/rate_variance)
+                if relative >= 1e-4:
+                    points2,sigma2,jump2 = posterior(fitted,other,taus,weights,groups,auto,start)
+                    norm = 1+relative
+                    mixture = [(fit,points,1/norm),(other,points2,relative/norm)]
+                    extra = pool_draws(fitted,futures,groups,auto,mixture,taus,start,last)
+                    rows, clouds = predict(extra,default,states,(sigma+relative*sigma2)/norm,
+                                           (jump+relative*jump2)/norm,missing,auto,scale,levels,start)
+                    diagnostic["stage"] = "S3"
+        except Exception:
+            pass
+
+    if DO_BACKTEST and ONLY_COMPONENT is None and time.monotonic()-start < 4.0*TIME_SCALE:
+        try:
+            calibrated, scale, origins, best, high = calibrate(
+                case,states,launch,last,target,auto,default,fit[1:3],start)
+            if origins:
                 rows = summarize(clouds,calibrated,levels,start,scale)
+                diagnostic.update(origins=origins,best=best,high=high,scale=scale,stage="S4")
         except Exception:
             pass
     return render(rows,states,groups,auto,unknown,levels,False)
